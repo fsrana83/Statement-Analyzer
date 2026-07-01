@@ -1,0 +1,6 @@
+{
+  "name": "Bank Statement Analyzer",
+  "description": "An intelligent tool to parse, analyze, and categorize bank statements (MT940, CSV, Excel), split transactions, track cash flow, and get AI financial insights.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
