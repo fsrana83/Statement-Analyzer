@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import { motion, AnimatePresence } from "motion/react";
-import { Sparkles, SlidersHorizontal, Table, Download, RefreshCw, Lock, ArrowLeft, Heart, Trash2, FileText } from "lucide-react";
-import { Transaction, TransactionSplit, StatementSummary, DEFAULT_CATEGORIES } from "./types";
+import { Sparkles, SlidersHorizontal, Table, Download, RefreshCw, Lock, ArrowLeft, Heart, Trash2, FileText, LogIn, LogOut, Cloud, Database } from "lucide-react";
+import { Transaction, TransactionSplit, StatementSummary, DEFAULT_CATEGORIES, AutoCategorizationRule } from "./types";
 import StatementUploader from "./components/StatementUploader";
 import TransactionList from "./components/TransactionList";
 import CategoryDashboard from "./components/CategoryDashboard";
@@ -9,6 +9,10 @@ import SplitModal from "./components/SplitModal";
 import AiAdvisor from "./components/AiAdvisor";
 import BudgetsCategories from "./components/BudgetsCategories";
 import ReconciliationTab from "./components/ReconciliationTab";
+import AuthScreen from "./components/AuthScreen";
+import { auth, db } from "./firebase";
+import { doc, getDoc, setDoc } from "firebase/firestore";
+import { onAuthStateChanged, signOut } from "firebase/auth";
 
 // Automatically delete unused demo categories
 const deleteUnusedDemoCategories = (currentTransactions: Transaction[], currentCats: string[]) => {
@@ -49,14 +53,19 @@ export default function App() {
   const [categories, setCategories] = useState<string[]>([]);
   const [softDeletedCategories, setSoftDeletedCategories] = useState<string[]>([]);
   const [auditLog, setAuditLog] = useState<{ timestamp: string, action: string, details: string }[]>([]);
+  const [customRules, setCustomRules] = useState<AutoCategorizationRule[]>([]);
   
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [activeView, setActiveView] = useState<"dashboard" | "transactions" | "budgets" | "reconciliation" | "ai-advisor">("dashboard");
   const [splitTransaction, setSplitTransaction] = useState<Transaction | null>(null);
 
-  // Restore state from LocalStorage on mount
-  useEffect(() => {
+  // Authentication states
+  const [currentUser, setCurrentUser] = useState<any>(null);
+  const [showAuthModal, setShowAuthModal] = useState(false);
+
+  // Helper to restore from local storage (used when guest mode or logged out)
+  const restoreFromLocalStorage = () => {
     try {
       const savedFileName = localStorage.getItem("bs_file_name");
       const savedFileType = localStorage.getItem("bs_file_type");
@@ -66,15 +75,25 @@ export default function App() {
       const savedCategories = localStorage.getItem("bs_categories");
       const savedSoftDeleted = localStorage.getItem("bs_soft_deleted_categories");
       const savedAuditLog = localStorage.getItem("bs_audit_log");
+      const savedCustomRules = localStorage.getItem("bs_custom_rules");
 
       if (savedSoftDeleted) {
         setSoftDeletedCategories(JSON.parse(savedSoftDeleted));
+      } else {
+        setSoftDeletedCategories([]);
       }
       if (savedAuditLog) {
         setAuditLog(JSON.parse(savedAuditLog));
+      } else {
+        setAuditLog([]);
+      }
+      if (savedCustomRules) {
+        setCustomRules(JSON.parse(savedCustomRules));
+      } else {
+        setCustomRules([]);
       }
 
-      let loadedCats = [...DEFAULT_CATEGORIES];
+      let loadedCats: string[] = [...DEFAULT_CATEGORIES];
       if (savedCategories) {
         loadedCats = JSON.parse(savedCategories);
       }
@@ -94,18 +113,110 @@ export default function App() {
         const cleanedCats = deleteUnusedDemoCategories(restoredTransactions, loadedCats);
         if (!cleanedCats.includes("UCLP Premium")) cleanedCats.push("UCLP Premium");
         setCategories(cleanedCats);
-        localStorage.setItem("bs_categories", JSON.stringify(cleanedCats));
       } else {
         if (!loadedCats.includes("UCLP Premium")) loadedCats.push("UCLP Premium");
         setCategories(loadedCats);
+        setFileName(null);
+        setFileType(null);
+        setTransactions([]);
+        setSummary(null);
+        setCategoryBudgets({});
+        setFileUploaded(false);
       }
     } catch (err) {
       console.error("Failed to restore cached statement state:", err);
       setCategories([...DEFAULT_CATEGORIES, "UCLP Premium"]);
     }
+  };
+
+  // Sync current memory state to Firebase Firestore
+  const syncCurrentStateToCloud = async (overrideUser?: any) => {
+    const userToUse = overrideUser || auth.currentUser;
+    if (!userToUse) return;
+    try {
+      const userDocRef = doc(db, "users", userToUse.uid, "data", "userData");
+      await setDoc(userDocRef, {
+        fileName,
+        fileType,
+        transactions,
+        summary,
+        categoryBudgets,
+        categories,
+        softDeletedCategories,
+        auditLog,
+        fileUploaded,
+        customRules,
+        updatedAt: new Date().toISOString()
+      });
+      console.log("State synced to Cloud!");
+    } catch (err) {
+      console.error("Error syncing current state to Cloud:", err);
+    }
+  };
+
+  // Firebase auth state change listener and data restorer
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, async (user) => {
+      setCurrentUser(user);
+      if (user) {
+        setIsLoading(true);
+        try {
+          const userDocRef = doc(db, "users", user.uid, "data", "userData");
+          const docSnap = await getDoc(userDocRef);
+          if (docSnap.exists()) {
+            const data = docSnap.data();
+            setFileName(data.fileName || null);
+            setFileType(data.fileType || null);
+            setTransactions(data.transactions || []);
+            setSummary(data.summary || null);
+            setCategoryBudgets(data.categoryBudgets || {});
+            setCategories(data.categories || []);
+            setSoftDeletedCategories(data.softDeletedCategories || []);
+            setAuditLog(data.auditLog || []);
+            setCustomRules(data.customRules || []);
+            setFileUploaded(!!data.fileUploaded);
+          } else {
+            // First time logging in, sync any already uploaded local state to the cloud
+            if (fileUploaded || customRules.length > 0) {
+              await setDoc(userDocRef, {
+                fileName,
+                fileType,
+                transactions,
+                summary,
+                categoryBudgets,
+                categories,
+                softDeletedCategories,
+                auditLog,
+                fileUploaded,
+                customRules,
+                updatedAt: new Date().toISOString()
+              });
+            }
+          }
+        } catch (err) {
+          console.error("Error loading user data from cloud:", err);
+        } finally {
+          setIsLoading(false);
+        }
+      } else {
+        // Fall back to local storage if user is a guest or logged out
+        restoreFromLocalStorage();
+      }
+    });
+    return () => unsubscribe();
   }, []);
 
-  // Save changes to LocalStorage when states change
+  // Debounced auto-save effect whenever cloud-synced state updates
+  useEffect(() => {
+    if (currentUser) {
+      const delayDebounceFn = setTimeout(() => {
+        syncCurrentStateToCloud();
+      }, 1200); // 1.2s debounce to avoid throttling Firebase writes on sliders/renames
+      return () => clearTimeout(delayDebounceFn);
+    }
+  }, [transactions, categoryBudgets, categories, softDeletedCategories, auditLog, fileUploaded, fileName, fileType, summary, customRules]);
+
+  // Combined offline and online state saving helper
   const saveStateToLocalStorage = (
     name: string,
     type: string,
@@ -114,8 +225,10 @@ export default function App() {
     budgets: Record<string, number>,
     cats?: string[],
     softDeleted?: string[],
-    log?: { timestamp: string, action: string, details: string }[]
+    log?: { timestamp: string, action: string, details: string }[],
+    rules?: AutoCategorizationRule[]
   ) => {
+    // 1. Save locally
     try {
       localStorage.setItem("bs_file_name", name);
       localStorage.setItem("bs_file_type", type);
@@ -125,8 +238,31 @@ export default function App() {
       localStorage.setItem("bs_categories", JSON.stringify(cats || categories));
       localStorage.setItem("bs_soft_deleted_categories", JSON.stringify(softDeleted || softDeletedCategories));
       localStorage.setItem("bs_audit_log", JSON.stringify(log || auditLog));
+      localStorage.setItem("bs_custom_rules", JSON.stringify(rules || customRules));
     } catch (err) {
       console.error("Failed to persist state to local cache:", err);
+    }
+
+    // 2. Save directly to Firestore if online
+    if (currentUser) {
+      try {
+        const userDocRef = doc(db, "users", currentUser.uid, "data", "userData");
+        setDoc(userDocRef, {
+          fileName: name,
+          fileType: type,
+          transactions: txs,
+          summary: sum,
+          categoryBudgets: budgets,
+          categories: cats || categories,
+          softDeletedCategories: softDeleted || softDeletedCategories,
+          auditLog: log || auditLog,
+          fileUploaded: true,
+          customRules: rules || customRules,
+          updatedAt: new Date().toISOString()
+        });
+      } catch (err) {
+        console.error("Failed to sync state to Firestore:", err);
+      }
     }
   };
 
@@ -161,6 +297,22 @@ export default function App() {
         let finalCat = tx.category;
         if (tx.description && tx.description.toLowerCase().includes('disbursement credit')) {
            finalCat = 'UCLP Premium';
+        } else {
+          // Apply custom auto-categorization rules
+          for (const rule of customRules) {
+            const desc = tx.description || "";
+            const cleanDesc = tx.cleanDescription || "";
+            const counterparty = tx.counterparty || "";
+            
+            if (
+              desc.toLowerCase().includes(rule.keyword.toLowerCase()) ||
+              cleanDesc.toLowerCase().includes(rule.keyword.toLowerCase()) ||
+              counterparty.toLowerCase().includes(rule.keyword.toLowerCase())
+            ) {
+              finalCat = rule.category;
+              break; // Stop at first match
+            }
+          }
         }
         return {
           ...tx,
@@ -312,6 +464,32 @@ export default function App() {
         return {
           ...tx,
           category: newCategory
+        };
+      }
+      return tx;
+    });
+
+    setTransactions(updatedTransactions);
+
+    if (fileName && fileType && summary) {
+      saveStateToLocalStorage(fileName, fileType, updatedTransactions, summary, categoryBudgets);
+    }
+  };
+
+  // Recurring Transactions confirm and frequency change handler
+  const handleRecurringChange = (
+    transactionId: string,
+    isRecurring: boolean,
+    frequency?: string,
+    isConfirmed?: boolean
+  ) => {
+    const updatedTransactions = transactions.map(tx => {
+      if (tx.id === transactionId) {
+        return {
+          ...tx,
+          isRecurring,
+          recurringFrequency: frequency || tx.recurringFrequency || "Monthly",
+          isRecurringConfirmed: isConfirmed !== undefined ? isConfirmed : tx.isRecurringConfirmed
         };
       }
       return tx;
@@ -479,6 +657,94 @@ export default function App() {
     }
   };
 
+  const handleAddRule = (keyword: string, category: string) => {
+    const trimmedKeyword = keyword.trim();
+    if (!trimmedKeyword || !category) return;
+
+    if (customRules.some(r => r.keyword.toLowerCase() === trimmedKeyword.toLowerCase())) {
+      alert(`A rule for "${trimmedKeyword}" already exists.`);
+      return;
+    }
+
+    const newRule: AutoCategorizationRule = {
+      id: typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(2, 9),
+      keyword: trimmedKeyword,
+      category
+    };
+    const updatedRules = [...customRules, newRule];
+    setCustomRules(updatedRules);
+    
+    // Auto-save to local and cloud
+    if (fileName && fileType && summary) {
+      saveStateToLocalStorage(fileName, fileType, transactions, summary, categoryBudgets, categories, softDeletedCategories, auditLog, updatedRules);
+    } else {
+      localStorage.setItem("bs_custom_rules", JSON.stringify(updatedRules));
+      if (currentUser) {
+        syncCurrentStateToCloud();
+      }
+    }
+  };
+
+  const handleDeleteRule = (ruleId: string) => {
+    const updatedRules = customRules.filter(r => r.id !== ruleId);
+    setCustomRules(updatedRules);
+    
+    // Auto-save to local and cloud
+    if (fileName && fileType && summary) {
+      saveStateToLocalStorage(fileName, fileType, transactions, summary, categoryBudgets, categories, softDeletedCategories, auditLog, updatedRules);
+    } else {
+      localStorage.setItem("bs_custom_rules", JSON.stringify(updatedRules));
+      if (currentUser) {
+        syncCurrentStateToCloud();
+      }
+    }
+  };
+
+  const handleApplyRulesToCurrent = () => {
+    if (transactions.length === 0) {
+      alert("No active statement has been uploaded yet.");
+      return;
+    }
+    
+    const updatedTransactions = transactions.map(tx => {
+      if (tx.isSplit) return tx;
+      
+      let finalCat = tx.category;
+      let matched = false;
+      for (const rule of customRules) {
+        const desc = tx.description || "";
+        const cleanDesc = tx.cleanDescription || "";
+        const counterparty = tx.counterparty || "";
+        
+        if (
+          desc.toLowerCase().includes(rule.keyword.toLowerCase()) ||
+          cleanDesc.toLowerCase().includes(rule.keyword.toLowerCase()) ||
+          counterparty.toLowerCase().includes(rule.keyword.toLowerCase())
+        ) {
+          finalCat = rule.category;
+          matched = true;
+          break;
+        }
+      }
+      
+      if (matched) {
+        return {
+          ...tx,
+          category: finalCat
+        };
+      }
+      return tx;
+    });
+    
+    setTransactions(updatedTransactions);
+    
+    if (fileName && fileType && summary) {
+      saveStateToLocalStorage(fileName, fileType, updatedTransactions, summary, categoryBudgets, categories, softDeletedCategories, auditLog);
+    }
+    
+    alert("Applied custom auto-categorization rules to current ledger successfully!");
+  };
+
   // Reset/Clear active statement
   const handleReset = () => {
     if (window.confirm("Are you sure you want to upload a new statement? Your current splits, budgets, and edits will be removed.")) {
@@ -610,64 +876,102 @@ export default function App() {
             </div>
           </div>
 
-          {fileUploaded && (
-            <div className="flex flex-wrap items-center gap-2 sm:gap-3 lg:justify-end">
-              {/* Loaded file details */}
-              <div className="bg-slate-50 border border-slate-200 px-3 py-1.5 rounded-md text-xs text-slate-600 flex items-center gap-2 max-w-full sm:max-w-xs w-full sm:w-auto">
-                <span className="w-2 h-2 bg-blue-600 rounded-full shrink-0 animate-pulse"></span>
-                <span className="truncate font-medium text-slate-700 block">{fileName}</span>
-              </div>
-
-              {/* Export Buttons */}
-              <button
-                onClick={handleExportPDF}
-                className="flex-1 sm:flex-none px-4 py-2 bg-slate-100 text-slate-700 hover:bg-slate-200 rounded-md font-medium text-xs border border-slate-200 transition flex items-center justify-center gap-1.5 cursor-pointer"
-                title="Export View to PDF"
-              >
-                <FileText className="w-3.5 h-3.5" />
-                <span>Export PDF</span>
-              </button>
-              <button
-                onClick={handleExportCSV}
-                className="flex-1 sm:flex-none px-4 py-2 bg-slate-100 text-slate-700 hover:bg-slate-200 rounded-md font-medium text-xs border border-slate-200 transition flex items-center justify-center gap-1.5 cursor-pointer"
-                title="Export Analyzed Statement to CSV"
-              >
-                <Download className="w-3.5 h-3.5" />
-                <span>Export CSV</span>
-              </button>
-
-              {/* Clear All Data Button */}
-              <button
-                onClick={() => {
-                  if (window.confirm("Are you sure you want to remove all uploaded ledgers and statements? This will reset the application.")) {
-                    localStorage.removeItem("bs_file_name");
-                    localStorage.removeItem("bs_file_type");
-                    localStorage.removeItem("bs_transactions");
-                    localStorage.removeItem("bs_summary");
-                    localStorage.removeItem("bs_budgets");
-                    localStorage.removeItem("rec_accounts");
-                    localStorage.removeItem("rec_ledger_map");
-                    localStorage.removeItem("rec_matches_map");
-                    localStorage.removeItem("rec_flagged_map");
-
-                    setFileUploaded(false);
-                    setFileType(null);
-                    setFileName(null);
-                    setTransactions([]);
-                    setSummary(null);
-                    setCategoryBudgets({});
-                    setError(null);
-                    setActiveView("dashboard");
-                  }
-                }}
-                className="flex-1 sm:flex-none px-4 py-2 bg-rose-50 text-rose-600 hover:bg-rose-100 rounded-md font-medium text-xs border border-rose-200 transition flex items-center justify-center gap-1.5 cursor-pointer"
-                title="Remove uploaded ledgers and statements"
-              >
-                <Trash2 className="w-3.5 h-3.5" />
-                <span>Clear Data</span>
-              </button>
+          <div className="flex flex-wrap items-center gap-3 lg:justify-end">
+            {/* Auth Indicator Controls */}
+            <div className="flex items-center gap-2">
+              {currentUser ? (
+                <div className="flex items-center gap-2 bg-indigo-50/60 border border-indigo-100/80 px-2.5 py-1 rounded-lg text-xs">
+                  <div className="w-5 h-5 bg-indigo-600 rounded-full text-[10px] text-white flex items-center justify-center font-bold">
+                    {currentUser.displayName ? currentUser.displayName[0].toUpperCase() : currentUser.email ? currentUser.email[0].toUpperCase() : "U"}
+                  </div>
+                  <span className="text-slate-600 font-medium hidden sm:inline max-w-[120px] truncate">
+                    {currentUser.displayName || currentUser.email}
+                  </span>
+                  <div className="h-4 w-[1px] bg-indigo-200"></div>
+                  <button
+                    onClick={async () => {
+                      if (window.confirm("Are you sure you want to sign out of your cloud sync account?")) {
+                        await signOut(auth);
+                      }
+                    }}
+                    className="text-indigo-600 hover:text-rose-600 font-bold flex items-center gap-1 transition cursor-pointer"
+                    title="Log out of cloud session"
+                  >
+                    <LogOut className="w-3.5 h-3.5" />
+                    <span className="hidden md:inline">Sign Out</span>
+                  </button>
+                </div>
+              ) : (
+                <button
+                  onClick={() => setShowAuthModal(true)}
+                  className="flex items-center gap-1.5 px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-bold transition shadow-sm hover:shadow cursor-pointer"
+                  title="Enable cloud backup & device synchronization"
+                >
+                  <Cloud className="w-3.5 h-3.5" />
+                  <span>Cloud Sync</span>
+                </button>
+              )}
             </div>
-          )}
+
+            {fileUploaded && (
+              <div className="flex items-center gap-2 sm:gap-3 flex-wrap">
+                {/* Loaded file details */}
+                <div className="bg-slate-50 border border-slate-200 px-3 py-1.5 rounded-md text-xs text-slate-600 flex items-center gap-2 max-w-full sm:max-w-xs w-full sm:w-auto">
+                  <span className="w-2 h-2 bg-blue-600 rounded-full shrink-0 animate-pulse"></span>
+                  <span className="truncate font-medium text-slate-700 block">{fileName}</span>
+                </div>
+
+                {/* Export Buttons */}
+                <button
+                  onClick={handleExportPDF}
+                  className="flex-1 sm:flex-none px-4 py-2 bg-slate-100 text-slate-700 hover:bg-slate-200 rounded-md font-medium text-xs border border-slate-200 transition flex items-center justify-center gap-1.5 cursor-pointer"
+                  title="Export View to PDF"
+                >
+                  <FileText className="w-3.5 h-3.5" />
+                  <span>Export PDF</span>
+                </button>
+                <button
+                  onClick={handleExportCSV}
+                  className="flex-1 sm:flex-none px-4 py-2 bg-slate-100 text-slate-700 hover:bg-slate-200 rounded-md font-medium text-xs border border-slate-200 transition flex items-center justify-center gap-1.5 cursor-pointer"
+                  title="Export Analyzed Statement to CSV"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  <span>Export CSV</span>
+                </button>
+
+                {/* Clear All Data Button */}
+                <button
+                  onClick={() => {
+                    if (window.confirm("Are you sure you want to remove all uploaded ledgers and statements? This will reset the application.")) {
+                      localStorage.removeItem("bs_file_name");
+                      localStorage.removeItem("bs_file_type");
+                      localStorage.removeItem("bs_transactions");
+                      localStorage.removeItem("bs_summary");
+                      localStorage.removeItem("bs_budgets");
+                      localStorage.removeItem("rec_accounts");
+                      localStorage.removeItem("rec_ledger_map");
+                      localStorage.removeItem("rec_matches_map");
+                      localStorage.removeItem("rec_flagged_map");
+
+                      setFileUploaded(false);
+                      setFileType(null);
+                      setFileName(null);
+                      setTransactions([]);
+                      setSummary(null);
+                      setCategoryBudgets({});
+                      setError(null);
+                      setActiveView("dashboard");
+                    }
+                  }}
+                  className="flex-1 sm:flex-none px-4 py-2 bg-rose-50 text-rose-600 hover:bg-rose-100 rounded-md font-medium text-xs border border-rose-200 transition flex items-center justify-center gap-1.5 cursor-pointer"
+                  title="Remove uploaded ledgers and statements"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  <span>Clear Data</span>
+                </button>
+              </div>
+            )}
+          </div>
         </div>
 
         {fileUploaded && (
@@ -762,6 +1066,7 @@ export default function App() {
                   onUnsplitClick={handleUnsplit}
                   onCategoryChange={handleCategoryChange}
                   softDeletedCategories={softDeletedCategories}
+                  onRecurringChange={handleRecurringChange}
                 />
               )}
 
@@ -776,6 +1081,10 @@ export default function App() {
                   onDeleteCategory={handleDeleteCategory}
                   softDeletedCategories={softDeletedCategories}
                   auditLog={auditLog}
+                  customRules={customRules}
+                  onAddRule={handleAddRule}
+                  onDeleteRule={handleDeleteRule}
+                  onApplyRulesToCurrent={handleApplyRulesToCurrent}
                 />
               )}
 
@@ -805,11 +1114,21 @@ export default function App() {
         />
       )}
 
+      {showAuthModal && (
+        <AuthScreen
+          onClose={() => setShowAuthModal(false)}
+          onGuestContinue={() => setShowAuthModal(false)}
+        />
+      )}
+
       {/* Simple Footer */}
       <footer className="h-10 bg-white border-t border-slate-200 px-6 flex items-center justify-between text-[11px] text-slate-400 select-none shrink-0">
         <div className="flex gap-4">
           <span className="flex items-center gap-1"><span className="w-1.5 h-1.5 bg-blue-600 rounded-full"></span> Connection: SECURE</span>
-          <span className="flex items-center gap-1"><span className="w-1.5 h-1.5 bg-emerald-500 rounded-full"></span> Storage: LOCAL CACHE</span>
+          <span className="flex items-center gap-1">
+            <span className={`w-1.5 h-1.5 ${currentUser ? "bg-indigo-500 animate-pulse" : "bg-emerald-500"} rounded-full`}></span>
+            Storage: {currentUser ? "CLOUD SECURE (FIREBASE)" : "LOCAL CACHE"}
+          </span>
         </div>
         <div className="flex items-center gap-4">
           <p className="flex items-center gap-1 font-semibold text-slate-500">

@@ -1,6 +1,9 @@
-import { ResponsiveContainer, AreaChart, Area, XAxis, YAxis, Tooltip, Legend, PieChart, Pie, Cell, LineChart, Line, CartesianGrid } from "recharts";
-import { TrendingUp, ArrowUpRight, ArrowDownLeft, Repeat, AlertTriangle, TrendingUp as TrendingUpIcon } from "lucide-react";
+import { useState } from "react";
+import { ResponsiveContainer, AreaChart, Area, XAxis, YAxis, Tooltip, Legend, PieChart, Pie, Cell, LineChart, Line, CartesianGrid, BarChart, Bar } from "recharts";
+import { TrendingUp, ArrowUpRight, ArrowDownLeft, Repeat, AlertTriangle, TrendingUp as TrendingUpIcon, FileText, Download, Sparkles, Check, Calendar, Info, SlidersHorizontal } from "lucide-react";
 import { Transaction, StatementSummary } from "../types";
+import { jsPDF } from "jspdf";
+import { toPng } from "html-to-image";
 
 interface CategoryDashboardProps {
   summary: StatementSummary;
@@ -32,6 +35,9 @@ export default function CategoryDashboard({
   categories,
   softDeletedCategories = []
 }: CategoryDashboardProps) {
+  const [activeSubTab, setActiveSubTab] = useState<"overview" | "reports">("overview");
+  const [isGeneratingPDF, setIsGeneratingPDF] = useState(false);
+
   // Re-calculate category totals to ensure split transactions are included properly
   const totalExpenses = transactions
     .filter(t => t.amount < 0)
@@ -185,249 +191,638 @@ export default function CategoryDashboard({
       };
     });
 
+  // --- LAST 6 MONTHS REPORTS CALCULATIONS ---
+  const latestTxDateStr = transactions.length > 0 
+    ? transactions.reduce((max, t) => t.date > max ? t.date : max, transactions[0].date)
+    : "2026-07-01";
+  
+  const latestDate = new Date(latestTxDateStr);
+  
+  const last6Months: string[] = [];
+  for (let i = 5; i >= 0; i--) {
+    const d = new Date(latestDate.getFullYear(), latestDate.getMonth() - i, 1);
+    const yyyy = d.getFullYear();
+    const mm = String(d.getMonth() + 1).padStart(2, '0');
+    last6Months.push(`${yyyy}-${mm}`);
+  }
+
+  const monthlyReportsData = last6Months.map(monthStr => {
+    const txsInMonth = transactions.filter(t => t.date.startsWith(monthStr));
+    
+    const categorySpending: Record<string, number> = {};
+    categories.forEach(cat => { categorySpending[cat] = 0; });
+    if (softDeletedCategories) {
+      softDeletedCategories.forEach(cat => { categorySpending[cat] = 0; });
+    }
+    categorySpending["Others"] = 0;
+    
+    let monthIncome = 0;
+    let monthExpenses = 0;
+    
+    txsInMonth.forEach(t => {
+      if (t.isSplit && t.splits) {
+        t.splits.forEach(s => {
+          const amt = s.amount;
+          const cat = s.category || "Others";
+          if (amt < 0) {
+            monthExpenses += Math.abs(amt);
+            categorySpending[cat] = (categorySpending[cat] || 0) + Math.abs(amt);
+          } else {
+            monthIncome += amt;
+          }
+        });
+      } else {
+        const cat = t.category || "Others";
+        if (t.amount < 0) {
+          monthExpenses += Math.abs(t.amount);
+          categorySpending[cat] = (categorySpending[cat] || 0) + Math.abs(t.amount);
+        } else {
+          monthIncome += t.amount;
+        }
+      }
+    });
+    
+    const netSavings = monthIncome - monthExpenses;
+    
+    return {
+      month: monthStr,
+      label: new Date(monthStr + "-15").toLocaleDateString(undefined, { month: "short", year: "2-digit" }),
+      income: parseFloat(monthIncome.toFixed(3)),
+      expenses: parseFloat(monthExpenses.toFixed(3)),
+      savings: parseFloat(netSavings.toFixed(3)),
+      categorySpending
+    };
+  });
+
+  // Calculate overall category totals over 6 months
+  const overallCategoryTotals: Record<string, number> = {};
+  monthlyReportsData.forEach(m => {
+    Object.keys(m.categorySpending).forEach(cat => {
+      overallCategoryTotals[cat] = (overallCategoryTotals[cat] || 0) + m.categorySpending[cat];
+    });
+  });
+  
+  const sortedTopCategories = Object.keys(overallCategoryTotals)
+    .map(cat => ({ category: cat, total: overallCategoryTotals[cat] }))
+    .filter(item => item.total > 0)
+    .sort((a, b) => b.total - a.total);
+    
+  const top5Categories = sortedTopCategories.slice(0, 5).map(c => c.category);
+
+  const categoryChartData = monthlyReportsData.map(d => {
+    const item: Record<string, any> = {
+      monthLabel: d.label,
+      month: d.month
+    };
+    let othersSum = 0;
+    Object.keys(d.categorySpending).forEach(cat => {
+      const amt = d.categorySpending[cat];
+      if (top5Categories.includes(cat)) {
+        item[cat] = parseFloat(amt.toFixed(3));
+      } else {
+        othersSum += amt;
+      }
+    });
+    if (othersSum > 0 || sortedTopCategories.length > 5) {
+      item["Others"] = parseFloat(othersSum.toFixed(3));
+    }
+    return item;
+  });
+
+  const getCatColor = (cat: string) => {
+    const idx = categories.indexOf(cat);
+    if (idx === -1) return "#64748b"; // fallback slate
+    return COLORS[idx % COLORS.length];
+  };
+
+  // Calculate 6-month aggregate KPIs
+  const reportsTotalIncome = monthlyReportsData.reduce((sum, m) => sum + m.income, 0);
+  const reportsTotalExpenses = monthlyReportsData.reduce((sum, m) => sum + m.expenses, 0);
+  const reportsTotalSavings = reportsTotalIncome - reportsTotalExpenses;
+  const reportsSavingsRate = reportsTotalIncome > 0 ? parseFloat(((reportsTotalSavings / reportsTotalIncome) * 100).toFixed(1)) : 0;
+  const reportsTopCategory = sortedTopCategories.length > 0 ? sortedTopCategories[0].category : "None";
+  const reportsTopCategoryAmt = sortedTopCategories.length > 0 ? sortedTopCategories[0].total : 0;
+
+  // PDF generation utilizing toPng and jsPDF
+  const handleGenerateReportPDF = async () => {
+    const reportElement = document.getElementById("six-month-report-printable");
+    if (!reportElement) return;
+    
+    setIsGeneratingPDF(true);
+    try {
+      const dataUrl = await toPng(reportElement, { cacheBust: true, pixelRatio: 2, backgroundColor: "#ffffff" });
+      const pdf = new jsPDF("p", "mm", "a4");
+      
+      const pdfWidth = pdf.internal.pageSize.getWidth();
+      const rect = reportElement.getBoundingClientRect();
+      const pdfHeight = (rect.height * pdfWidth) / rect.width;
+      
+      pdf.addImage(dataUrl, "PNG", 0, 0, pdfWidth, pdfHeight);
+      pdf.save(`LedgerFlow_6Month_Report_${new Date().toISOString().split("T")[0]}.pdf`);
+    } catch (error) {
+      console.error("6-Month PDF Report generation failed:", error);
+      alert("Failed to export 6-Month PDF Report.");
+    } finally {
+      setIsGeneratingPDF(false);
+    }
+  };
+
   return (
-    <div className="space-y-8" id="financial-dashboard-container">
-      {/* KPI Cards Grid */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
-        {/* Total Income */}
-        <div className="bg-white border border-slate-200 p-6 rounded-2xl shadow-xs hover:shadow-sm transition flex items-center justify-between">
-          <div>
-            <span className="text-xs font-semibold text-slate-500 uppercase tracking-wider block">Total Income</span>
-            <span className="text-xl font-black text-slate-950 mt-1.5 block font-mono">
-              +ر.ع. {totalIncome.toLocaleString(undefined, { minimumFractionDigits: 3, maximumFractionDigits: 3 })}
-            </span>
-          </div>
-          <div className="w-12 h-12 rounded-xl bg-emerald-50 text-emerald-600 border border-emerald-100 flex items-center justify-center">
-            <ArrowUpRight className="w-6 h-6" />
-          </div>
-        </div>
-
-        {/* Total Expenses */}
-        <div className="bg-white border border-slate-200 p-6 rounded-2xl shadow-xs hover:shadow-sm transition flex items-center justify-between">
-          <div>
-            <span className="text-xs font-semibold text-slate-500 uppercase tracking-wider block">Total Expenses</span>
-            <span className="text-xl font-black text-slate-950 mt-1.5 block font-mono">
-              -ر.ع. {totalExpenses.toLocaleString(undefined, { minimumFractionDigits: 3, maximumFractionDigits: 3 })}
-            </span>
-          </div>
-          <div className="w-12 h-12 rounded-xl bg-rose-50 text-rose-600 border border-rose-100 flex items-center justify-center">
-            <ArrowDownLeft className="w-6 h-6" />
-          </div>
-        </div>
-
-        {/* Net Savings */}
-        <div className="bg-white border border-slate-200 p-6 rounded-2xl shadow-xs hover:shadow-sm transition flex items-center justify-between">
-          <div>
-            <span className="text-xs font-semibold text-slate-500 uppercase tracking-wider block">Net Savings</span>
-            <span className={`text-xl font-black mt-1.5 block font-mono ${netSavings >= 0 ? "text-emerald-700" : "text-rose-600"}`}>
-              {netSavings >= 0 ? "+" : "-"}ر.ع. {Math.abs(netSavings).toLocaleString(undefined, { minimumFractionDigits: 3, maximumFractionDigits: 3 })}
-            </span>
-          </div>
-          <div className={`w-12 h-12 rounded-xl flex items-center justify-center border ${netSavings >= 0 ? "bg-emerald-50 text-emerald-600 border-emerald-100" : "bg-rose-50 text-rose-600 border-rose-100"}`}>
-            <TrendingUp className="w-6 h-6" />
-          </div>
-        </div>
-
-        {/* Savings Rate */}
-        <div className="bg-white border border-slate-200 p-6 rounded-2xl shadow-xs hover:shadow-sm transition flex items-center justify-between">
-          <div>
-            <span className="text-xs font-semibold text-slate-500 uppercase tracking-wider block">Savings Rate</span>
-            <span className={`text-2xl font-black mt-1.5 block font-mono ${savingsRate >= 20 ? "text-emerald-700" : savingsRate > 0 ? "text-amber-700" : "text-rose-600"}`}>
-              {savingsRate}%
-            </span>
-          </div>
-          <div className="w-12 h-12 rounded-xl bg-slate-50 text-slate-600 border border-slate-250 flex items-center justify-center font-bold text-sm">
-            %
-          </div>
-        </div>
+    <div className="space-y-6" id="dashboard-tab-container">
+      {/* Sub-tab selection row */}
+      <div className="flex bg-slate-100 p-1 rounded-xl border border-slate-200 shrink-0 self-start md:self-center max-w-[240px]" id="dashboard-subtab-navigation">
+        <button
+          onClick={() => setActiveSubTab("overview")}
+          className={`flex-1 px-4 py-1.5 text-xs font-bold rounded-lg flex items-center justify-center gap-1.5 transition-all cursor-pointer ${
+            activeSubTab === "overview"
+              ? "bg-white text-slate-900 shadow-xs"
+              : "text-slate-500 hover:text-slate-800"
+          }`}
+        >
+          <SlidersHorizontal className="w-3.5 h-3.5" />
+          Overview
+        </button>
+        <button
+          onClick={() => setActiveSubTab("reports")}
+          className={`flex-1 px-4 py-1.5 text-xs font-bold rounded-lg flex items-center justify-center gap-1.5 transition-all cursor-pointer ${
+            activeSubTab === "reports"
+              ? "bg-white text-slate-900 shadow-xs"
+              : "text-slate-500 hover:text-slate-800"
+          }`}
+        >
+          <FileText className="w-3.5 h-3.5" />
+          Reports
+        </button>
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-        {/* Daily Cash Flow Area Chart */}
-        <div className="bg-white border border-slate-200 rounded-2xl p-6 shadow-sm lg:col-span-2">
-          <h4 className="text-md font-bold text-slate-900 mb-1">Cash Flow Trend</h4>
-          <p className="text-xs text-slate-500 mb-6">Daily aggregated income versus expenses</p>
+      {activeSubTab === "overview" ? (
+        <div className="space-y-8 animate-fadeIn" id="financial-dashboard-container">
+          {/* KPI Cards Grid */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
+            {/* Total Income */}
+            <div className="bg-white border border-slate-200 p-6 rounded-2xl shadow-xs hover:shadow-sm transition flex items-center justify-between">
+              <div>
+                <span className="text-xs font-semibold text-slate-500 uppercase tracking-wider block">Total Income</span>
+                <span className="text-xl font-black text-slate-950 mt-1.5 block font-mono">
+                  +ر.ع. {totalIncome.toLocaleString(undefined, { minimumFractionDigits: 3, maximumFractionDigits: 3 })}
+                </span>
+              </div>
+              <div className="w-12 h-12 rounded-xl bg-emerald-50 text-emerald-600 border border-emerald-100 flex items-center justify-center">
+                <ArrowUpRight className="w-6 h-6" />
+              </div>
+            </div>
 
-          <div className="h-72 w-full">
-            {chartDailyFlowData.length === 0 ? (
-              <div className="h-full flex items-center justify-center text-slate-400 text-sm">No cash flow data available.</div>
-            ) : (
-              <ResponsiveContainer width="100%" height="100%">
-                <AreaChart data={chartDailyFlowData} margin={{ left: -10, right: 10, top: 10, bottom: 0 }}>
-                  <defs>
-                    <linearGradient id="colorIncome" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="5%" stopColor="#2563eb" stopOpacity={0.2}/>
-                      <stop offset="95%" stopColor="#2563eb" stopOpacity={0}/>
-                    </linearGradient>
-                    <linearGradient id="colorExpenses" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="5%" stopColor="#ef4444" stopOpacity={0.15}/>
-                      <stop offset="95%" stopColor="#ef4444" stopOpacity={0}/>
-                    </linearGradient>
-                  </defs>
-                  <XAxis dataKey="date" stroke="#94a3b8" fontSize={11} tickLine={false} />
-                  <YAxis stroke="#94a3b8" fontSize={11} tickLine={false} />
-                  <Tooltip formatter={(value) => `ر.ع. ${parseFloat(String(value)).toFixed(3)}`} />
-                  <Legend iconType="circle" />
-                  <Area type="monotone" dataKey="Income" stroke="#2563eb" strokeWidth={2} fillOpacity={1} fill="url(#colorIncome)" />
-                  <Area type="monotone" dataKey="Expenses" stroke="#ef4444" strokeWidth={2} fillOpacity={1} fill="url(#colorExpenses)" />
-                </AreaChart>
-              </ResponsiveContainer>
-            )}
-          </div>
-        </div>
+            {/* Total Expenses */}
+            <div className="bg-white border border-slate-200 p-6 rounded-2xl shadow-xs hover:shadow-sm transition flex items-center justify-between">
+              <div>
+                <span className="text-xs font-semibold text-slate-500 uppercase tracking-wider block">Total Expenses</span>
+                <span className="text-xl font-black text-slate-950 mt-1.5 block font-mono">
+                  -ر.ع. {totalExpenses.toLocaleString(undefined, { minimumFractionDigits: 3, maximumFractionDigits: 3 })}
+                </span>
+              </div>
+              <div className="w-12 h-12 rounded-xl bg-rose-50 text-rose-600 border border-rose-100 flex items-center justify-center">
+                <ArrowDownLeft className="w-6 h-6" />
+              </div>
+            </div>
 
-        {/* Category Expenses Share */}
-        <div className="bg-white border border-slate-200 rounded-2xl p-6 shadow-sm flex flex-col justify-between">
-          <div>
-            <h4 className="text-md font-bold text-slate-900 mb-1">Expense Breakdown</h4>
-            <p className="text-xs text-slate-500 mb-6">Percentage allocation of total expenditure</p>
-          </div>
+            {/* Net Savings */}
+            <div className="bg-white border border-slate-200 p-6 rounded-2xl shadow-xs hover:shadow-sm transition flex items-center justify-between">
+              <div>
+                <span className="text-xs font-semibold text-slate-500 uppercase tracking-wider block">Net Savings</span>
+                <span className={`text-xl font-black mt-1.5 block font-mono ${netSavings >= 0 ? "text-emerald-700" : "text-rose-600"}`}>
+                  {netSavings >= 0 ? "+" : "-"}ر.ع. {Math.abs(netSavings).toLocaleString(undefined, { minimumFractionDigits: 3, maximumFractionDigits: 3 })}
+                </span>
+              </div>
+              <div className={`w-12 h-12 rounded-xl flex items-center justify-center border ${netSavings >= 0 ? "bg-emerald-50 text-emerald-600 border-emerald-100" : "bg-rose-50 text-rose-600 border-rose-100"}`}>
+                <TrendingUp className="w-6 h-6" />
+              </div>
+            </div>
 
-          <div className="h-56 relative flex items-center justify-center">
-            {categoryBreakdownData.length === 0 ? (
-              <div className="text-slate-400 text-sm">No expenses to display.</div>
-            ) : (
-              <ResponsiveContainer width="100%" height="100%">
-                <PieChart>
-                  <Pie
-                    data={categoryBreakdownData}
-                    dataKey="amount"
-                    nameKey="category"
-                    cx="50%"
-                    cy="50%"
-                    outerRadius={75}
-                    innerRadius={45}
-                    paddingAngle={3}
-                  >
-                    {categoryBreakdownData.map((entry, index) => (
-                      <Cell key={`cell-${index}`} fill={COLORS[categories.indexOf(entry.category) % COLORS.length]} />
-                    ))}
-                  </Pie>
-                  <Tooltip formatter={(value) => `ر.ع. ${parseFloat(String(value)).toFixed(3)}`} />
-                </PieChart>
-              </ResponsiveContainer>
-            )}
+            {/* Savings Rate */}
+            <div className="bg-white border border-slate-200 p-6 rounded-2xl shadow-xs hover:shadow-sm transition flex items-center justify-between">
+              <div>
+                <span className="text-xs font-semibold text-slate-500 uppercase tracking-wider block">Savings Rate</span>
+                <span className={`text-2xl font-black mt-1.5 block font-mono ${savingsRate >= 20 ? "text-emerald-700" : savingsRate > 0 ? "text-amber-700" : "text-rose-600"}`}>
+                  {savingsRate}%
+                </span>
+              </div>
+              <div className="w-12 h-12 rounded-xl bg-slate-50 text-slate-600 border border-slate-250 flex items-center justify-center font-bold text-sm">
+                %
+              </div>
+            </div>
           </div>
 
-          {/* Top legend rows */}
-          <div className="mt-4 space-y-1.5 max-h-32 overflow-y-auto pr-1">
-            {categoryBreakdownData.slice(0, 4).map((entry) => {
-              const percent = totalExpenses > 0 ? ((entry.amount / totalExpenses) * 100).toFixed(1) : "0";
-              const catColor = COLORS[categories.indexOf(entry.category) % COLORS.length];
-              return (
-                <div key={entry.category} className="flex items-center justify-between text-xs">
-                  <div className="flex items-center gap-1.5 truncate text-slate-700">
-                    <div className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: catColor }}></div>
-                    <span className="truncate font-semibold">{entry.category}</span>
-                  </div>
-                  <span className="font-mono text-slate-500 font-semibold">ر.ع. {entry.amount.toFixed(3)} ({percent}%)</span>
-                </div>
-              );
-            })}
-            {categoryBreakdownData.length > 4 && (
-              <p className="text-[10px] text-slate-400 text-center font-medium italic pt-1">
-                + {categoryBreakdownData.length - 4} other categories
-              </p>
-            )}
-          </div>
-        </div>
-      </div>
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+            {/* Daily Cash Flow Area Chart */}
+            <div className="bg-white border border-slate-200 rounded-2xl p-6 shadow-sm lg:col-span-2">
+              <h4 className="text-md font-bold text-slate-900 mb-1">Cash Flow Trend</h4>
+              <p className="text-xs text-slate-500 mb-6">Daily aggregated income versus expenses</p>
 
-      {/* Net Cash Flow Trend Line Chart */}
-      <div className="bg-white border border-slate-200 rounded-2xl p-6 shadow-sm">
-        <h4 className="text-md font-bold text-slate-900 mb-1">Net Cash Flow Trend</h4>
-        <p className="text-xs text-slate-500 mb-6">Daily net cash flow and cumulative balance over the period</p>
+              <div className="h-72 w-full">
+                {chartDailyFlowData.length === 0 ? (
+                  <div className="h-full flex items-center justify-center text-slate-400 text-sm">No cash flow data available.</div>
+                ) : (
+                  <ResponsiveContainer width="100%" height="100%">
+                    <AreaChart data={chartDailyFlowData} margin={{ left: -10, right: 10, top: 10, bottom: 0 }}>
+                      <defs>
+                        <linearGradient id="colorIncome" x1="0" y1="0" x2="0" y2="1">
+                          <stop offset="5%" stopColor="#2563eb" stopOpacity={0.2}/>
+                          <stop offset="95%" stopColor="#2563eb" stopOpacity={0}/>
+                        </linearGradient>
+                        <linearGradient id="colorExpenses" x1="0" y1="0" x2="0" y2="1">
+                          <stop offset="5%" stopColor="#ef4444" stopOpacity={0.15}/>
+                          <stop offset="95%" stopColor="#ef4444" stopOpacity={0}/>
+                        </linearGradient>
+                      </defs>
+                      <XAxis dataKey="date" stroke="#94a3b8" fontSize={11} tickLine={false} />
+                      <YAxis stroke="#94a3b8" fontSize={11} tickLine={false} />
+                      <Tooltip formatter={(value) => `ر.ع. ${parseFloat(String(value)).toFixed(3)}`} />
+                      <Legend iconType="circle" />
+                      <Area type="monotone" dataKey="Income" stroke="#2563eb" strokeWidth={2} fillOpacity={1} fill="url(#colorIncome)" />
+                      <Area type="monotone" dataKey="Expenses" stroke="#ef4444" strokeWidth={2} fillOpacity={1} fill="url(#colorExpenses)" />
+                    </AreaChart>
+                  </ResponsiveContainer>
+                )}
+              </div>
+            </div>
 
-        <div className="h-72 w-full">
-          {chartDailyFlowData.length === 0 ? (
-            <div className="h-full flex items-center justify-center text-slate-400 text-sm">No cash flow data available.</div>
-          ) : (
-            <ResponsiveContainer width="100%" height="100%">
-              <LineChart data={chartDailyFlowData} margin={{ left: -10, right: 10, top: 10, bottom: 0 }}>
-                <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
-                <XAxis dataKey="date" stroke="#94a3b8" fontSize={11} tickLine={false} />
-                <YAxis stroke="#94a3b8" fontSize={11} tickLine={false} />
-                <Tooltip formatter={(value) => `ر.ع. ${parseFloat(String(value)).toFixed(3)}`} />
-                <Legend iconType="circle" />
-                <Line type="monotone" dataKey="Net Flow" stroke="#10b981" strokeWidth={2} dot={{ r: 3, fill: "#10b981" }} activeDot={{ r: 5 }} />
-                <Line type="monotone" dataKey="Cumulative Net" stroke="#6366f1" strokeWidth={2} dot={false} activeDot={{ r: 4 }} />
-              </LineChart>
-            </ResponsiveContainer>
-          )}
-        </div>
-      </div>
+            {/* Category Expenses Share */}
+            <div className="bg-white border border-slate-200 rounded-2xl p-6 shadow-sm flex flex-col justify-between">
+              <div>
+                <h4 className="text-md font-bold text-slate-900 mb-1">Expense Breakdown</h4>
+                <p className="text-xs text-slate-500 mb-6">Percentage allocation of total expenditure</p>
+              </div>
 
-      {/* Subscription & Recurring Overview */}
-      <div className="bg-white border border-slate-200 rounded-2xl p-6 shadow-sm">
-        <div className="flex items-center justify-between mb-6">
-          <div>
-            <h4 className="text-md font-bold text-slate-900 mb-1 flex items-center gap-2">
-              <Repeat className="w-5 h-5 text-amber-500" />
-              Subscription & Recurring Overview
-            </h4>
-            <p className="text-xs text-slate-500">
-              Impact of recurring subscriptions and bills on your budget
-            </p>
-          </div>
-          <div className="text-right">
-            <span className="text-xs font-semibold text-slate-500 uppercase tracking-wider block">Total Recurring</span>
-            <span className="text-lg font-black text-rose-600 mt-1 block font-mono">
-              -ر.ع. {totalRecurringExpenses.toLocaleString(undefined, { minimumFractionDigits: 3, maximumFractionDigits: 3 })}
-            </span>
-          </div>
-        </div>
+              <div className="h-56 relative flex items-center justify-center">
+                {categoryBreakdownData.length === 0 ? (
+                  <div className="text-slate-400 text-sm">No expenses to display.</div>
+                ) : (
+                  <ResponsiveContainer width="100%" height="100%">
+                    <PieChart>
+                      <Pie
+                        data={categoryBreakdownData}
+                        dataKey="amount"
+                        nameKey="category"
+                        cx="50%"
+                        cy="50%"
+                        outerRadius={75}
+                        innerRadius={45}
+                        paddingAngle={3}
+                      >
+                        {categoryBreakdownData.map((entry, index) => (
+                          <Cell key={`cell-${index}`} fill={COLORS[categories.indexOf(entry.category) % COLORS.length]} />
+                        ))}
+                      </Pie>
+                      <Tooltip formatter={(value) => `ر.ع. ${parseFloat(String(value)).toFixed(3)}`} />
+                    </PieChart>
+                  </ResponsiveContainer>
+                )}
+              </div>
 
-        {recurringBreakdown.length === 0 ? (
-          <div className="flex items-center justify-center py-8 text-slate-400 text-sm">
-            No recurring transactions identified in this period.
-          </div>
-        ) : (
-          <div className="space-y-6">
-            {recurringAlerts.length > 0 && (
-              <div className="bg-amber-50 border border-amber-200 rounded-xl p-4">
-                <h5 className="text-sm font-bold text-amber-800 flex items-center gap-2 mb-3">
-                  <AlertTriangle className="w-4 h-4" />
-                  Subscription Alerts ({recurringAlerts.length})
-                </h5>
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                  {recurringAlerts.map((alert, index) => (
-                    <div key={index} className="bg-white border border-amber-100 p-3 rounded-lg flex items-start gap-3">
-                      <div className={`mt-0.5 w-6 h-6 rounded-full flex items-center justify-center shrink-0 ${alert.type === 'increase' ? 'bg-rose-100 text-rose-600' : 'bg-amber-100 text-amber-600'}`}>
-                        {alert.type === 'increase' ? <TrendingUpIcon className="w-3.5 h-3.5" /> : <Repeat className="w-3.5 h-3.5" />}
+              {/* Top legend rows */}
+              <div className="mt-4 space-y-1.5 max-h-32 overflow-y-auto pr-1">
+                {categoryBreakdownData.slice(0, 4).map((entry) => {
+                  const percent = totalExpenses > 0 ? ((entry.amount / totalExpenses) * 100).toFixed(1) : "0";
+                  const catColor = COLORS[categories.indexOf(entry.category) % COLORS.length];
+                  return (
+                    <div key={entry.category} className="flex items-center justify-between text-xs">
+                      <div className="flex items-center gap-1.5 truncate text-slate-700">
+                        <div className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: catColor }}></div>
+                        <span className="truncate font-semibold">{entry.category}</span>
                       </div>
-                      <div>
-                        <span className="text-xs font-bold text-slate-800 block">{alert.title}</span>
-                        <span className="text-[10px] text-slate-500 mt-0.5 block">{alert.message}</span>
-                      </div>
+                      <span className="font-mono text-slate-500 font-semibold">ر.ع. {entry.amount.toFixed(3)} ({percent}%)</span>
                     </div>
-                  ))}
+                  );
+                })}
+                {categoryBreakdownData.length > 4 && (
+                  <p className="text-[10px] text-slate-400 text-center font-medium italic pt-1">
+                    + {categoryBreakdownData.length - 4} other categories
+                  </p>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* Net Cash Flow Trend Line Chart */}
+          <div className="bg-white border border-slate-200 rounded-2xl p-6 shadow-sm">
+            <h4 className="text-md font-bold text-slate-900 mb-1">Net Cash Flow Trend</h4>
+            <p className="text-xs text-slate-500 mb-6">Daily net cash flow and cumulative balance over the period</p>
+
+            <div className="h-72 w-full">
+              {chartDailyFlowData.length === 0 ? (
+                <div className="h-full flex items-center justify-center text-slate-400 text-sm">No cash flow data available.</div>
+              ) : (
+                <ResponsiveContainer width="100%" height="100%">
+                  <LineChart data={chartDailyFlowData} margin={{ left: -10, right: 10, top: 10, bottom: 0 }}>
+                    <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
+                    <XAxis dataKey="date" stroke="#94a3b8" fontSize={11} tickLine={false} />
+                    <YAxis stroke="#94a3b8" fontSize={11} tickLine={false} />
+                    <Tooltip formatter={(value) => `ر.ع. ${parseFloat(String(value)).toFixed(3)}`} />
+                    <Legend iconType="circle" />
+                    <Line type="monotone" dataKey="Net Flow" stroke="#10b981" strokeWidth={2} dot={{ r: 3, fill: "#10b981" }} activeDot={{ r: 5 }} />
+                    <Line type="monotone" dataKey="Cumulative Net" stroke="#6366f1" strokeWidth={2} dot={false} activeDot={{ r: 4 }} />
+                  </LineChart>
+                </ResponsiveContainer>
+              )}
+            </div>
+          </div>
+
+          {/* Subscription & Recurring Overview */}
+          <div className="bg-white border border-slate-200 rounded-2xl p-6 shadow-sm">
+            <div className="flex items-center justify-between mb-6">
+              <div>
+                <h4 className="text-md font-bold text-slate-900 mb-1 flex items-center gap-2">
+                  <Repeat className="w-5 h-5 text-amber-500" />
+                  Subscription & Recurring Overview
+                </h4>
+                <p className="text-xs text-slate-500">
+                  Impact of recurring subscriptions and bills on your budget
+                </p>
+              </div>
+              <div className="text-right">
+                <span className="text-xs font-semibold text-slate-500 uppercase tracking-wider block">Total Recurring</span>
+                <span className="text-lg font-black text-rose-600 mt-1 block font-mono">
+                  -ر.ع. {totalRecurringExpenses.toLocaleString(undefined, { minimumFractionDigits: 3, maximumFractionDigits: 3 })}
+                </span>
+              </div>
+            </div>
+
+            {recurringBreakdown.length === 0 ? (
+              <div className="flex items-center justify-center py-8 text-slate-400 text-sm">
+                No recurring transactions identified in this period.
+              </div>
+            ) : (
+              <div className="space-y-6">
+                {recurringAlerts.length > 0 && (
+                  <div className="bg-amber-50 border border-amber-200 rounded-xl p-4">
+                    <h5 className="text-sm font-bold text-amber-800 flex items-center gap-2 mb-3">
+                      <AlertTriangle className="w-4 h-4" />
+                      Subscription Alerts ({recurringAlerts.length})
+                    </h5>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                      {recurringAlerts.map((alert, index) => (
+                        <div key={index} className="bg-white border border-amber-100 p-3 rounded-lg flex items-start gap-3">
+                          <div className={`mt-0.5 w-6 h-6 rounded-full flex items-center justify-center shrink-0 ${alert.type === 'increase' ? 'bg-rose-100 text-rose-600' : 'bg-amber-100 text-amber-600'}`}>
+                            {alert.type === 'increase' ? <TrendingUpIcon className="w-3.5 h-3.5" /> : <Repeat className="w-3.5 h-3.5" />}
+                          </div>
+                          <div>
+                            <span className="text-xs font-bold text-slate-800 block">{alert.title}</span>
+                            <span className="text-[10px] text-slate-500 mt-0.5 block">{alert.message}</span>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+                
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                  {recurringBreakdown.map((item, index) => {
+                    const percent = totalExpenses > 0 ? ((item.amount / totalExpenses) * 100).toFixed(1) : "0";
+                    const percentOfRecurring = totalRecurringExpenses > 0 ? ((item.amount / totalRecurringExpenses) * 100).toFixed(1) : "0";
+                    
+                    return (
+                      <div key={index} className="bg-slate-50 border border-slate-100 p-4 rounded-xl flex items-center justify-between">
+                        <div className="overflow-hidden">
+                          <span className="text-sm font-semibold text-slate-800 truncate block w-full">{item.name}</span>
+                          <span className="text-[10px] text-slate-500 mt-1 block">{percentOfRecurring}% of recurring</span>
+                        </div>
+                        <div className="text-right shrink-0">
+                          <span className="text-sm font-mono font-bold text-slate-700 block">ر.ع. {item.amount.toFixed(3)}</span>
+                          <span className="text-[10px] text-slate-400 mt-1 block">{percent}% of budget</span>
+                        </div>
+                      </div>
+                    );
+                  })}
                 </div>
               </div>
             )}
+          </div>
+        </div>
+      ) : (
+        /* --- NEW REPORTS SUB-SECTION --- */
+        <div className="space-y-6 animate-fadeIn" id="financial-reports-container">
+          {/* Export Toolbar */}
+          <div className="flex items-center justify-between bg-white border border-slate-200 p-5 rounded-2xl shadow-xs">
+            <div>
+              <h4 className="text-sm font-bold text-slate-950 uppercase tracking-wider flex items-center gap-2">
+                <FileText className="w-4.5 h-4.5 text-blue-600" />
+                6-Month Budget Performance Report
+              </h4>
+              <p className="text-xs text-slate-500 mt-1">
+                Generates a print-ready Executive summary & detailed category trends
+              </p>
+            </div>
             
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-              {recurringBreakdown.map((item, index) => {
-                const percent = totalExpenses > 0 ? ((item.amount / totalExpenses) * 100).toFixed(1) : "0";
-                const percentOfRecurring = totalRecurringExpenses > 0 ? ((item.amount / totalRecurringExpenses) * 100).toFixed(1) : "0";
+            <button
+              onClick={handleGenerateReportPDF}
+              disabled={isGeneratingPDF}
+              className="px-4 py-2 text-xs bg-slate-950 text-white font-bold hover:bg-slate-800 rounded-xl transition flex items-center gap-2 disabled:opacity-50 cursor-pointer"
+            >
+              {isGeneratingPDF ? (
+                <>
+                  <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+                  Generating...
+                </>
+              ) : (
+                <>
+                  <Download className="w-4 h-4" />
+                  Download PDF
+                </>
+              )}
+            </button>
+          </div>
+
+          {/* Printable Document Sheet */}
+          <div id="six-month-report-printable" className="bg-white border border-slate-200 p-8 rounded-2xl shadow-sm space-y-8 text-slate-950">
+            {/* Report Header Letterhead */}
+            <div className="border-b border-slate-200 pb-6 flex items-start justify-between">
+              <div>
+                <span className="text-[10px] font-bold text-blue-600 uppercase tracking-widest block">Financial Intelligence Report</span>
+                <h2 className="text-2xl font-black text-slate-900 mt-1">LedgerFlow 6-Month Analysis</h2>
+                <p className="text-xs text-slate-500 mt-1 flex items-center gap-1.5">
+                  <Calendar className="w-4 h-4 text-slate-400" />
+                  Statement Period: {last6Months[0]} to {last6Months[5]} &bull; Generated on July 1, 2026
+                </p>
+              </div>
+              <div className="text-right">
+                <div className="font-extrabold text-lg text-slate-900 flex items-center justify-end gap-1">
+                  <Sparkles className="w-4 h-4 text-blue-600" />
+                  LedgerFlow
+                </div>
+                <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mt-1 block">CONFIDENTIAL STATEMENT SUMMARY</span>
+              </div>
+            </div>
+
+            {/* Executive KPIs */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4">
+              <div className="bg-slate-50 border border-slate-200 p-4 rounded-xl">
+                <span className="text-[10px] font-bold text-slate-500 uppercase block">6-Month Total Income</span>
+                <span className="text-lg font-bold text-slate-900 block font-mono mt-1">+ر.ع. {reportsTotalIncome.toFixed(3)}</span>
+                <span className="text-[9px] text-slate-400 block mt-0.5">Aggregate payrolls and wage inflows</span>
+              </div>
+              
+              <div className="bg-slate-50 border border-slate-200 p-4 rounded-xl">
+                <span className="text-[10px] font-bold text-slate-500 uppercase block">6-Month Total Expenses</span>
+                <span className="text-lg font-bold text-slate-900 block font-mono mt-1">-ر.ع. {reportsTotalExpenses.toFixed(3)}</span>
+                <span className="text-[9px] text-slate-400 block mt-0.5">Aggregate card and bank debits</span>
+              </div>
+
+              <div className="bg-slate-50 border border-slate-200 p-4 rounded-xl">
+                <span className="text-[10px] font-bold text-slate-500 uppercase block">6-Month Net Savings</span>
+                <span className={`text-lg font-bold block font-mono mt-1 ${reportsTotalSavings >= 0 ? "text-emerald-700" : "text-rose-600"}`}>
+                  {reportsTotalSavings >= 0 ? "+" : "-"}ر.ع. {Math.abs(reportsTotalSavings).toFixed(3)}
+                </span>
+                <span className="text-[9px] text-slate-400 block mt-0.5">Overall reserve build rate</span>
+              </div>
+
+              <div className="bg-slate-50 border border-slate-200 p-4 rounded-xl">
+                <span className="text-[10px] font-bold text-slate-500 uppercase block">Overall Savings Rate</span>
+                <span className="text-lg font-bold text-slate-900 block font-mono mt-1">{reportsSavingsRate}%</span>
+                <span className="text-[9px] text-slate-400 block mt-0.5">Target: 20%+ of total income</span>
+              </div>
+            </div>
+
+            {/* Top Categories Card & Performance Indicator */}
+            <div className="bg-blue-50/50 border border-blue-100 p-4 rounded-xl flex flex-col md:flex-row items-center justify-between gap-4">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-xl bg-blue-100 text-blue-600 flex items-center justify-center font-bold">
+                  ★
+                </div>
+                <div>
+                  <h5 className="text-xs font-bold text-slate-800 uppercase tracking-wider">Top spending outlays</h5>
+                  <p className="text-xs text-slate-600 mt-0.5">
+                    Your highest expense category is <span className="font-bold text-blue-700">{reportsTopCategory}</span> with a total of <span className="font-mono font-bold text-blue-700">ر.ع. {reportsTopCategoryAmt.toFixed(3)}</span>.
+                  </p>
+                </div>
+              </div>
+              <div className="text-xs text-slate-500 bg-white px-3 py-1.5 border border-slate-200 rounded-lg">
+                Aggregate Savings Rate: <span className={`font-mono font-black ${reportsSavingsRate >= 20 ? "text-emerald-700" : reportsSavingsRate > 0 ? "text-amber-700" : "text-rose-600"}`}>{reportsSavingsRate}%</span>
+              </div>
+            </div>
+
+            {/* Charts Visualizations Grid */}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-8 pt-4">
+              {/* Monthly spending trend bar chart */}
+              <div className="border border-slate-200 p-5 rounded-xl bg-white">
+                <h4 className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-1">Monthly Cash Flow Trend</h4>
+                <p className="text-[11px] text-slate-400 mb-4">Inflows and expenses comparison over the last 6 months</p>
                 
-                return (
-                  <div key={index} className="bg-slate-50 border border-slate-100 p-4 rounded-xl flex items-center justify-between">
-                    <div className="overflow-hidden">
-                      <span className="text-sm font-semibold text-slate-800 truncate block w-full">{item.name}</span>
-                      <span className="text-[10px] text-slate-500 mt-1 block">{percentOfRecurring}% of recurring</span>
-                    </div>
-                    <div className="text-right shrink-0">
-                      <span className="text-sm font-mono font-bold text-slate-700 block">ر.ع. {item.amount.toFixed(3)}</span>
-                      <span className="text-[10px] text-slate-400 mt-1 block">{percent}% of budget</span>
-                    </div>
-                  </div>
-                );
-              })}
+                <div className="h-60 w-full">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <BarChart data={monthlyReportsData} margin={{ left: -15, right: 5, top: 5, bottom: 5 }}>
+                      <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
+                      <XAxis dataKey="label" stroke="#94a3b8" fontSize={10} tickLine={false} />
+                      <YAxis stroke="#94a3b8" fontSize={10} tickLine={false} />
+                      <Tooltip formatter={(value) => `ر.ع. ${parseFloat(String(value)).toFixed(3)}`} />
+                      <Legend iconType="circle" wrapperStyle={{ fontSize: '10px' }} />
+                      <Bar dataKey="income" name="Income" fill="#2563eb" radius={[3, 3, 0, 0]} />
+                      <Bar dataKey="expenses" name="Expenses" fill="#ef4444" radius={[3, 3, 0, 0]} />
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
+              </div>
+
+              {/* Stacked spending categories performance */}
+              <div className="border border-slate-200 p-5 rounded-xl bg-white">
+                <h4 className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-1">Category Spending Performance</h4>
+                <p className="text-[11px] text-slate-400 mb-4">Allocation across top 5 spending channels + others</p>
+                
+                <div className="h-60 w-full">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <BarChart data={categoryChartData} margin={{ left: -15, right: 5, top: 5, bottom: 5 }}>
+                      <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
+                      <XAxis dataKey="monthLabel" stroke="#94a3b8" fontSize={10} tickLine={false} />
+                      <YAxis stroke="#94a3b8" fontSize={10} tickLine={false} />
+                      <Tooltip formatter={(value) => `ر.ع. ${parseFloat(String(value)).toFixed(3)}`} />
+                      <Legend iconType="circle" wrapperStyle={{ fontSize: '10px' }} />
+                      {top5Categories.map((cat, idx) => (
+                        <Bar 
+                          key={cat} 
+                          dataKey={cat} 
+                          name={cat} 
+                          stackId="a" 
+                          fill={getCatColor(cat)} 
+                        />
+                      ))}
+                      {sortedTopCategories.length > 5 && (
+                        <Bar dataKey="Others" name="Others" stackId="a" fill="#64748b" radius={[3, 3, 0, 0]} />
+                      )}
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
+              </div>
+            </div>
+
+            {/* Tabular category spending detail over the last 6 months */}
+            <div className="border border-slate-200 rounded-xl overflow-hidden pt-4">
+              <div className="px-5 pb-3">
+                <h4 className="text-xs font-bold text-slate-500 uppercase tracking-wider">Detailed Category Spending breakdown</h4>
+                <p className="text-[10px] text-slate-400 mt-0.5">Month-by-month cash outlay values per category</p>
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-left border-collapse text-xs">
+                  <thead>
+                    <tr className="border-b border-slate-200 bg-slate-50 text-[10px] uppercase font-bold text-slate-500">
+                      <th className="px-4 py-3">Category</th>
+                      {monthlyReportsData.map(d => (
+                        <th key={d.month} className="px-4 py-3 text-right">{d.label}</th>
+                      ))}
+                      <th className="px-4 py-3 text-right font-bold text-slate-900 bg-blue-50/50">Total</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-150 text-slate-700">
+                    {Object.keys(overallCategoryTotals)
+                      .filter(cat => overallCategoryTotals[cat] > 0)
+                      .map(cat => {
+                        return (
+                          <tr key={cat} className="hover:bg-slate-50/50">
+                            <td className="px-4 py-3 font-semibold text-slate-900 flex items-center gap-1.5">
+                              <span 
+                                className="w-2 h-2 rounded-full inline-block shrink-0" 
+                                style={{ backgroundColor: getCatColor(cat) }}
+                              ></span>
+                              {cat}
+                            </td>
+                            {monthlyReportsData.map(m => {
+                              const amt = m.categorySpending[cat] || 0;
+                              return (
+                                <td key={m.month} className="px-4 py-3 text-right font-mono text-[11px]">
+                                  {amt > 0 ? `ر.ع. ${amt.toFixed(3)}` : "—"}
+                                </td>
+                              );
+                            })}
+                            <td className="px-4 py-3 text-right font-mono font-bold text-blue-700 bg-blue-50/20">
+                              ر.ع. {overallCategoryTotals[cat].toFixed(3)}
+                            </td>
+                          </tr>
+                        );
+                      })
+                    }
+                    {/* Aggregated Totals Row */}
+                    <tr className="border-t-2 border-slate-200 bg-slate-50 font-bold">
+                      <td className="px-4 py-3 text-slate-900 uppercase tracking-wide">Total Outflow</td>
+                      {monthlyReportsData.map(m => (
+                        <td key={m.month} className="px-4 py-3 text-right font-mono text-slate-900 font-bold">
+                          ر.ع. {m.expenses.toFixed(3)}
+                        </td>
+                      ))}
+                      <td className="px-4 py-3 text-right font-mono font-black text-blue-900 bg-blue-100/40">
+                        ر.ع. {reportsTotalExpenses.toFixed(3)}
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {/* Disclaimer & Footer */}
+            <div className="border-t border-slate-200 pt-6 text-[10px] text-slate-400 flex flex-col sm:flex-row items-center justify-between gap-4">
+              <span>Report generated automatically via LedgerFlow financial intelligence models.</span>
+              <span className="font-mono">ID: 6M-ANALYTICS-2026</span>
             </div>
           </div>
-        )}
-      </div>
-
+        </div>
+      )}
     </div>
   );
 }

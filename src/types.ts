@@ -20,6 +20,8 @@ export interface Transaction {
   confidence?: number; // AI confidence score (0-1)
   originalCategory?: string; // Store original AI category in case of user overrides
   isRecurring?: boolean;
+  recurringFrequency?: string; // e.g., 'Monthly' | 'Weekly' | 'Annually' | 'Quarterly' | 'Bi-weekly'
+  isRecurringConfirmed?: boolean;
 }
 
 export interface CategoryBudget {
@@ -86,3 +88,10 @@ export const DEFAULT_CATEGORIES = [
   "Education",
   "Others"
 ] as const;
+
+export interface AutoCategorizationRule {
+  id: string;
+  keyword: string;
+  category: string;
+}
+
